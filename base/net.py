@@ -4,6 +4,7 @@ from mxnet.gluon import nn
 from params import *
 import numpy as np
 import random
+from base.units import ctx_for_tranf
 
 
 class FashionNet(gluon.Block):
@@ -13,33 +14,50 @@ class FashionNet(gluon.Block):
         # self.explore_self()
         # self.base_1, self.base_2 = \
         self.vgg_baseNet()
+        self.shared = self.shared_FC()
         self.vector = nn.Sequential()
         for i in range(len(classes)):
             self.vector.add(self.extract_vector(nums_attres[i]))
 
     def forward(self, *args):
-        x, w, keypoint = args
-        outs = []
+        x, w, keypoint = self.sv2gpu(*args)
+        outs = {}
         featues = self.base_1(x)
         by_pass_mask = self.spatical_drop_out(featues, keypoint)
         featues = self.base_2(featues)
         featues = featues * by_pass_mask
         featues = self.base_3(featues)
-        for i in range(len(classes)):
-            outs.append(self.vector[i](featues) * w[:, i].reshape((-1, 1)))
+        featues = self.shared(featues)
+        for branch in w.keys():
+            cur_featue = [featues[i] for i in w[branch]]
+            cur_featue = nd.stack(*cur_featue)
+            outs[branch] = self.vector[branch](cur_featue)
         return outs
+
+    def sv2gpu(self, *args):
+        data, weight, point, ctx = args
+        if not isinstance(ctx, list):
+            data = data.as_in_context(ctx)
+            point = point.as_in_context(ctx)
+        return data, weight, point
+
+    def shared_FC(self):
+        shared = nn.Sequential()
+        with self.name_scope():
+            shared.add(nn.Flatten())
+            shared.add(nn.Dense(4096))
+            shared.add(nn.BatchNorm(axis=1, center=True, scale=True))
+            shared.add(nn.Activation(activation='relu'))
+        return shared
 
     # for regression (attributes) & classification (values)
     def extract_vector(self, num_outputs):
         branch = nn.Sequential()
-        branch.add(nn.Flatten())
-        branch.add(nn.Dense(4096))
-        branch.add(nn.BatchNorm(axis=1, center=True, scale=True))
-        branch.add(nn.Activation(activation='relu'))
-        branch.add(nn.Dense(4096))
-        branch.add(nn.BatchNorm(axis=1, center=True, scale=True))
-        branch.add(nn.Activation(activation='relu'))
-        branch.add(nn.Dense(num_outputs))
+        with self.name_scope():
+            branch.add(nn.Dense(4096, in_units=4096))
+            branch.add(nn.BatchNorm(axis=1, in_channels=4096, center=True, scale=True))
+            branch.add(nn.Activation(activation='relu'))
+            branch.add(nn.Dense(num_outputs, in_units=4096))
         return branch
 
     # company 1 | VGG net as bases
@@ -54,9 +72,9 @@ class FashionNet(gluon.Block):
 
     def vgg_stack(self, architecture):
         out = nn.Sequential()
-        # with self.name_scope():
         for (num_convs, channels) in architecture:
-            out.add(self.vgg_block(num_convs, channels))
+            with self.name_scope():
+                out.add(self.vgg_block(num_convs, channels))
         return out
 
     def vgg_baseNet(self):
@@ -69,14 +87,15 @@ class FashionNet(gluon.Block):
         self.base_2 = self.vgg_stack(architecture_2)
         self.base_3 = self.vgg_stack(architecture_3)
         # special for bypass net
-        channels = [512, 512, 256, 64, 1]
+        channels = [512, 512, 256, 256, 1]
         self.by_pass = self.build_by_pass(channels)
 
     def build_by_pass(self, channels):
         out = nn.Sequential()
-        for c in channels:
-            out.add(nn.Conv2D(c, kernel_size=3, padding=1, activation='relu'))
-        out.add(nn.AvgPool2D(2, 2))
+        with self.name_scope():
+            for c in channels:
+                out.add(nn.Conv2D(c, kernel_size=3, padding=1, activation='relu'))
+            out.add(nn.AvgPool2D(2, 2))
         return out
 
     ############################
@@ -99,13 +118,15 @@ class FashionNet(gluon.Block):
             return OHEM_mask
 
     def explore_seeds(self, x, proportion=0.6):
+        proportion_self = get_self_handle()
         b, _, h, w = x.shape
         k = int(h * w * proportion)
-        top_k_values = nd.topk(x.flatten(), k=k, ret_typ='value')
-        idx = [random.choice(range(int(k * 0.1), int(k * proportion_self)))
+        top_k_values = nd.topk(x.detach().flatten(), k=k, ret_typ='value')
+        idx = [random.choice(range(int(k * (proportion_self - 0.2)), int(k * proportion_self)))
                for i in range(b)]
-        line = list(range(b))
-        threshold = top_k_values[line, idx]
+        idx = nd.array(idx).as_in_context(x.context)
+        # line = list(range(b))
+        threshold = top_k_values.pick(idx)
         threshold = threshold.reshape((-1, 1, 1, 1))
         seeds = (x > threshold) * 5.0
         return seeds
@@ -150,8 +171,10 @@ class cls_loss(gluon.Block):
         self.loss = gluon.loss.SoftmaxCrossEntropyLoss(sparse_label=False)
 
     def forward(self, *args):
-        outs, lable, transf = args  # weight,
-        vis_outs, attr_outs, new_label = self.project(outs, transf, lable)
+        outs, weight, lable, transf = args
+        # ctx_for_tranf(transf, ctx)
+
+        vis_outs, attr_outs, new_label = self.project(outs, weight, transf, lable)
         loss_vis = self.vis_loss(vis_outs, new_label)
         loss_attr = self.attr_loss(attr_outs, new_label)
         return loss_attr + loss_vis
@@ -162,66 +185,77 @@ class cls_loss(gluon.Block):
         l = []
         for label, out in zip(labels, outs):
             Isvisible = [label[:, 0], nd.sum(label[:, 1:], axis=1)]
-            Isvisible = nd.stack(*Isvisible).T.as_in_context(outs[0].context)
-            # Isvisible = nd.array(Isvisible)
-            # loss = self.cross_entropy(yhat, Isvisible)
+            Isvisible = self.sv2gpu(nd.stack(*Isvisible).T, out.context)
             l.append(self.loss(out, Isvisible))
-        return reduce(lambda x, y: nd.sum(x) + nd.sum(y), l)
+        l = nd.sum(l[0]) if len(l) == 1 else reduce(lambda x, y: nd.sum(x) + nd.sum(y), l)
+        return l
 
     def attr_loss(self, outs, labels):
         # ignore this part by set the loss to 0
         # when labels is 0
         l = []
         for label, out in zip(labels, outs):
-            attributes = label[:, 1:].as_in_context(outs[0].context)
+            attributes = self.sv2gpu(label[:, 1:], out.context)
             discard = nd.sum(attributes, axis=1)
-            if len([1 for dis in discard if dis not in [0, 1]]) > 0:
-                print "discard has errors"
+            # if len([1 for dis in discard if dis not in [0, 1]]) > 0:
+            #     print "discard has errors"
             l.append(self.loss(out, attributes.T) * discard)
-        return reduce(lambda x, y: nd.sum(x) + nd.sum(y), l)
+        l = nd.sum(l[0]) if len(l) == 1 else reduce(lambda x, y: nd.sum(x) + nd.sum(y), l)
+        return l
 
-    def project(self, outs, transf, label):
+    def project(self, outs, weight, transf, label):
         # -$$- making label
         attr_outs, vis_outs, new_labels, valuable_branch = [], [], [], []
         branches_out_detect = np.array([t['branch'] for t in transf])
-        # zero = nd.array([0]).as_in_context(outs[0].context)
-        for i in range(len(nums_attres)):  # branches loop
-            temp_out_attr, temp_out_vis = [], []
-            # cur_nums_attres = nums_attres[i]
-            # temp_transf_attr = nd.array(np.eye(
-            #     cur_nums_attres, cur_nums_attres - 1, -1)).as_in_context(outs[i].context)
-            # temp_transf_vis = nd.array(np.eye(cur_nums_attres, 2)).as_in_context(outs[i].context)
-            has_transf = np.where(branches_out_detect == i)[0]
-            exist_label = []
-            for j in range(len(branches_out_detect)):  # batches loop
-                if j in has_transf:
-                    transf_attr = transf[j]['attr']
-                    transf_vis = transf[j]['vis']
-                    temp_out_attr.append(nd.dot(outs[i][j, :], transf_attr))
-                    temp_out_vis.append(nd.dot(outs[i][j, :], transf_vis))
-                    exist_label.append(nd.array(label[i][j, :]))
-                # else:
-                #     temp_out_attr.append(nd.dot(outs[i][j, :], temp_transf_attr))
-                #     temp_out_vis.append(nd.dot(outs[i][j, :], temp_transf_vis))
-            if len(has_transf) > 0:
-                vis_outs.append(nd.stack(*temp_out_vis))
-                attr_outs.append(nd.stack(*temp_out_attr))
-                new_labels.append(nd.stack(*exist_label))
-                valuable_branch.append(i)  # same with weight
-            # else:
-            #     vis_outs.append(zero)
-            #     attr_outs.append(zero)
-            # -$$- prepare label by has_transf
+        valuable_branch = {}
+        for batch, branch in enumerate(branches_out_detect):
+            if branch in valuable_branch.keys():
+                valuable_branch[branch].append(batch)
+            else:
+                valuable_branch[branch] = [batch]
+        assert valuable_branch == weight
 
-        return vis_outs, attr_outs, new_labels  # , valuable_branch
+        # order matters nothing
+        for branch in valuable_branch.keys():
+            batches = valuable_branch[branch]
+            temp_out_attr, temp_out_vis, exist_label = [], [], []
+            ctx = outs[branch].context
+            for j, batch in enumerate(batches):
+                transf_attr = self.sv2gpu(transf[batch]['attr'], ctx)
+                transf_vis = self.sv2gpu(transf[batch]['vis'], ctx)
+                assert branch == transf[batch]['branch']
+                temp_out_attr.append(nd.dot(outs[branch][j, :], transf_attr))
+                temp_out_vis.append(nd.dot(outs[branch][j, :], transf_vis))
+                exist_label.append(nd.array(label[batch]))
+            vis_outs.append(nd.stack(*temp_out_vis))
+            attr_outs.append(nd.stack(*temp_out_attr))
+            new_labels.append(nd.stack(*exist_label))
+        return vis_outs, attr_outs, new_labels
 
-    # def softmax(self, y_linear):
-    #     exp = nd.exp(y_linear - nd.max(y_linear, axis=1).reshape((-1, 1)))
-    #     norms = nd.sum(exp, axis=1).reshape((-1, 1))
-    #     return exp / norms
-    #
-    # def cross_entropy(self, yhat, y):
-    #     return - nd.sum(y * nd.log(yhat + 1e-6))
+    def sv2gpu(self, data, ctx):
+        if not isinstance(data, nd.ndarray.NDArray):
+            data = nd.array(data)
+        data = data.as_in_context(ctx)
+        return data
+
+
+class test_loss(gluon.Block):
+    def __init__(self):
+        # only use once to initialize paramers.
+        super(test_loss, self).__init__()
+        self.loss = gluon.loss.SoftmaxCrossEntropyLoss(sparse_label=False)
+
+    def forward(self, *args):
+        outs, weight, lable = args
+        l = []
+        for branch in weight.keys():
+            batches = weight[branch]
+            t = [nd.array(lable[i]) for i in batches]
+            gt = nd.array(*t).as_in_context(outs[branch].context)
+
+            l.append(self.loss(outs[branch], gt))
+        l = nd.sum(l[0]) if len(l) == 1 else reduce(lambda x, y: nd.sum(x) + nd.sum(y), l)
+        return l
 
 
 if __name__ == "__main__":

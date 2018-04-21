@@ -1,6 +1,6 @@
 from mxnet.gluon.data import dataset
 from mxnet import image, nd
-import csv, random, json
+import csv, random, json, math
 from base.params import *
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,9 +20,13 @@ class loader(dataset.Dataset):
         img = self.read_img(img_path)
         gt_labels, transf_matrix = self.read_label(label, attr)
         self.read_json(img_path)
-        keypoint = self.build_canvas()
-        # self.show_img(img, keypoint)
-        return img, self.cls_wight, gt_labels, transf_matrix, keypoint
+        try:
+            keypoint = self.build_canvas()
+            # self.show_img(img, keypoint)
+            return img, [self.cls_index, gt_labels], transf_matrix, nd.array(keypoint)
+        except Exception, e:
+            print('*' * 10, idx, '  loader errore ', e)
+            return
 
     def __len__(self):
         return len(self.items)
@@ -46,9 +50,9 @@ class loader(dataset.Dataset):
 
     def read_label(self, label, attr):
         # wight
-        self.cls_wight = [0] * len(classes)
+        # self.cls_wight = [0] * len(classes)
         self.cls_index = classes.index(label)
-        self.cls_wight[self.cls_index] = 1
+        # self.cls_wight[self.cls_index] = 1
 
         # vaule or gt,the first one is index of 'y'
         if 'm' not in attr:
@@ -61,7 +65,7 @@ class loader(dataset.Dataset):
             self.values = [b[i] for i in attr]
         self.values.insert(0, attr.index('y'))
         # prepare labels
-        gt_labels, transf_matrix = self.prepare_lables(self.cls_wight, self.values)
+        gt_labels, transf_matrix = self.prepare_lables(self.values)
         return gt_labels, transf_matrix
 
     def read_json(self, img_path):
@@ -78,18 +82,21 @@ class loader(dataset.Dataset):
         new_keypoints = self.prepare_json_point(keypoint)
         self.hint = self.prepare_hints_by_point(new_keypoints, self.cls_index)
 
-    def prepare_lables(self, weight, label):
+    def prepare_lables(self, label):
         """
         :param gt_:global ground truth for all branches
         :param projected:transform matrix for that turn output of net to input of softmax
         :return:
         """
-        gt_ = [np.zeros(n, dtype=np.bool) for n in nums_attres]
+        cur_idx_branch = self.cls_index  # weight.index(1)
+        cur_nums_attres = nums_attres[cur_idx_branch]
+        # gt_ = [np.zeros(n, dtype=np.bool) for n in nums_attres]
+        # gt_ = np.zeros(cur_nums_attres, dtype=np.bool)
         projected = {}
         # prepare attributes
-        cur_idx_branch, y_idx_gt = weight.index(1), label[0]
-        cur_nums_attres = nums_attres[cur_idx_branch]
-        gt_[cur_idx_branch] = (np.array(label)[1:] >= 0.8)
+        y_idx_gt = label[0]
+        # gt_[cur_idx_branch] = (np.array(label)[1:] >= 0.8)
+        gt_ = (np.array(label)[1:] >= 0.8)
         # prepare transfer & the input of softmax
         # 1)visible attributes; 2)invisible attribute
         transfer_attr = np.eye(cur_nums_attres, cur_nums_attres - 1, -1)  # -1 means diagonal lower by 1
@@ -99,14 +106,15 @@ class loader(dataset.Dataset):
             transfer_attr[1:, y_idx_gt - 1] = label[2:]
         else:
             transfer_vis[:, 0] = label[1:]  # protect the maybe attributes
-            gt_[cur_idx_branch][1:] = (np.array(label)[2:] >= 0.2)
+            # gt_[cur_idx_branch][1:] = (np.array(label)[2:] >= 0.2)
+            gt_[1:] = (np.array(label)[2:] >= 0.2)
         projected['vis'] = transfer_vis
         projected['attr'] = transfer_attr
         projected['branch'] = cur_idx_branch
-        abnormal_ = np.array([np.sum(x) for x in gt_])
-        abnormal = np.sum(abnormal_)
-        if abnormal > 1 or abnormal == 0:
-            print '--abnormal in fashion_loader--'
+        # check abnormal article
+        # abnormal_ = np.array([np.sum(x) for x in gt_])
+        # abnormal = np.sum(abnormal_)
+        # assert abnormal==1
         return gt_, projected
 
     def prepare_json_point(self, keypoint):
@@ -120,7 +128,9 @@ class loader(dataset.Dataset):
                     continue
                 # line column
                 a, b = 1.0 * y / h * img_height, 1.0 * x / w * img_width
-                a, b = int(round(a / stride_all)), int(round(b / stride_all))
+                a, b = int(a / stride_all), int(b / stride_all)
+                a = a - 1 if a == 16 else a
+                b = b - 1 if b == 16 else b
                 new_keypoints[i].append([a, b])
         # maybe can not remove all multi parts
         # check mirror parts
@@ -151,7 +161,7 @@ class loader(dataset.Dataset):
                     e1 = end.pop(0)
                 if not start and not end:
                     break
-        return nd.array(hint).T
+        return np.array(hint).T
 
     # all points should be and must be within the range
     def draw_line(self, s, e):
@@ -195,10 +205,12 @@ class loader(dataset.Dataset):
             return res_h, res_w
 
     def build_canvas(self):
-        temp = nd.zeros((int(img_height / stride_all), int(img_width / stride_all)))
-        end = int(self.hint.shape[-1] * proportion_hint)
+        proportion_hint=get_hint_handle()
+        temp = np.zeros((int(img_height / stride_all), int(img_width / stride_all)))
         if self.hint.size:
-            keypoint = self.hint[:, :end]  # .asnumpy().astype(np.uint8)
+            _, w = self.hint.shape
+            end = int(w * proportion_hint)
+            keypoint = self.hint[:, :end]
             temp[keypoint[0], keypoint[1]] = 5.0
         return temp
 
@@ -210,8 +222,8 @@ class loader(dataset.Dataset):
         # temp = np.zeros((int(img_height / stride_all), int(img_width / stride_all)))
         # keypoint = self.hint.asnumpy().astype(np.uint8)
         # temp[keypoint[0], keypoint[1]] = 1
-        temp = map.asnumpy()
-        plt.imshow(temp)
+        # temp = map.asnumpy()
+        plt.imshow(map)
         plt.show()
 
 
@@ -221,6 +233,7 @@ if __name__ == "__main__":
     hint_gt = img_path % 'FashionMark/base/%s'
     f_d = loader(input, hint_gt)
     idx = random.randint(0, len(f_d))
+    idx = random.choice([70267, 53789, 26727])
     datas = f_d[idx]
 
     plt.imshow(datas[0].asnumpy())
